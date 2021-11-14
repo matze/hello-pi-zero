@@ -16,15 +16,13 @@
 //!     RES -> 35 (BCM: 19)
 //!
 //! ```
-mod met;
 mod onewire;
 
-use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, FixedOffset};
+use anyhow::{Context, Result};
 use embedded_graphics as gfx;
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
-use log::info;
+use embedded_graphics::primitives::*;
 use sh1106::displaysize::DisplaySize;
 use sh1106::mode::GraphicsMode;
 use std::sync::Arc;
@@ -40,9 +38,6 @@ async fn fallible_sleep(duration: time::Duration) -> Result<()> {
 
 struct InnerState {
     ds18b20: onewire::Ds18b20,
-    client: met::Client,
-    expires: Option<DateTime<FixedOffset>>,
-    last_response: Option<met::Response>,
 }
 
 #[derive(Clone)]
@@ -55,38 +50,121 @@ impl State {
     async fn home_temperature(&self) -> Result<f32> {
         Ok(self.inner.read().await.ds18b20.read().await?)
     }
+}
 
-    /// Return forecast data if not stale yet.
-    async fn forecast(&self) -> Result<Vec<f32>> {
-        let mut state = self.inner.write().await;
-        let now = chrono::Local::now();
+#[rustfmt::skip]
+const ARROW_UP: &[u8] = &[
+    0b00000100, 0b0000_0000,
+    0b00001110, 0b0000_0000,
+    0b00011111, 0b0000_0000,
+    0b00111111, 0b1000_0000,
+    0b01111111, 0b1100_0000,
+    0b11111111, 0b1110_0000,
+];
 
-        // Return early if we should not update the forecast data
-        if let Some(expires) = state.expires {
-            if now < expires {
-                if let Some(response) = &state.last_response {
-                    return Ok(response.next_n_hours(now, 48)?);
-                }
-            }
+#[rustfmt::skip]
+const ARROW_DOWN: &[u8] = &[
+    0b11111111, 0b1110_0000,
+    0b01111111, 0b1100_0000,
+    0b00111111, 0b1000_0000,
+    0b00011111, 0b0000_0000,
+    0b00001110, 0b0000_0000,
+    0b00000100, 0b0000_0000,
+];
+
+const INPUT_DIGITS_HUGE: &[u8] = include_bytes!("assets/input-36-64.raw");
+const INPUT_DIGITS_REGULAR: &[u8] = include_bytes!("assets/input-20-32.raw");
+const DANGER: &[u8] = include_bytes!("assets/danger-24-24.raw");
+
+struct Digits<'a> {
+    atlas: gfx::image::ImageRaw<'a, BinaryColor>,
+    sprite_size: Size,
+    top_left: Point,
+}
+
+impl<'a> Digits<'a> {
+    fn new(data: &'a [u8], top_left: Point, full_width: u32, sprite_size: Size) -> Self {
+        Self {
+            atlas: gfx::image::ImageRaw::<BinaryColor>::new(data, full_width),
+            sprite_size,
+            top_left,
         }
+    }
 
-        info!("fetching forecast data");
+    fn draw<DT>(&self, digits: u8, target: &mut DT) -> Result<(), DT::Error>
+    where
+        DT: DrawTarget<Color = BinaryColor>,
+    {
+        let digits = digits.clamp(0, 99);
+        let d1 = (digits / 10) as i32;
+        let d2 = (digits % 10) as i32;
 
-        let response = state.client.get().await?;
+        let size = &self.sprite_size;
 
-        let value = response
-            .headers()
-            .get("expires")
-            .ok_or_else(|| anyhow!("No expires in the header map"))?;
+        let d1 = self.atlas.sub_image(&Rectangle::new(
+            Point::new(d1 * size.width as i32, 0),
+            *size,
+        ));
 
-        let expires = chrono::DateTime::parse_from_rfc2822(value.to_str()?)?;
-        state.expires = Some(expires);
+        let d2 = self.atlas.sub_image(&Rectangle::new(
+            Point::new(d2 * size.width as i32, 0),
+            *size,
+        ));
 
-        let response: met::Response = response.json().await?;
-        let data = response.next_n_hours(now, 48)?;
-        state.last_response = Some(response);
+        gfx::image::Image::new(&d1, self.top_left).draw(target)?;
+        gfx::image::Image::new(
+            &d2,
+            self.top_left + Point::new(self.sprite_size.width as i32, 0),
+        )
+        .draw(target)?;
 
-        Ok(data)
+        Ok(())
+    }
+}
+
+impl<'a> Dimensions for Digits<'a> {
+    fn bounding_box(&self) -> Rectangle {
+        Rectangle {
+            top_left: self.top_left,
+            size: Size::new(self.sprite_size.width * 2, self.sprite_size.height),
+        }
+    }
+}
+
+struct ArrowIndicators<'a> {
+    up: gfx::image::ImageRaw<'a, BinaryColor>,
+    down: gfx::image::ImageRaw<'a, BinaryColor>,
+    up_pos: Point,
+    down_pos: Point,
+}
+
+impl<'a> ArrowIndicators<'a> {
+    fn new<T: Dimensions>(thing: &T) -> Self {
+        let bounding_box = thing.bounding_box();
+        let x = bounding_box.top_left.x + bounding_box.size.width as i32 - 2;
+        let y_up = bounding_box.top_left.y;
+        let y_down = bounding_box.top_left.y + bounding_box.size.height as i32 - 11;
+
+        Self {
+            up: gfx::image::ImageRaw::<BinaryColor>::new(ARROW_UP, 11),
+            down: gfx::image::ImageRaw::<BinaryColor>::new(ARROW_DOWN, 11),
+            up_pos: Point::new(x, y_up),
+            down_pos: Point::new(x, y_down),
+        }
+    }
+
+    fn draw_up<DT>(&self, target: &mut DT) -> Result<(), DT::Error>
+    where
+        DT: DrawTarget<Color = BinaryColor>,
+    {
+        gfx::image::Image::new(&self.up, self.up_pos).draw(target)
+    }
+
+    fn draw_down<DT>(&self, target: &mut DT) -> Result<(), DT::Error>
+    where
+        DT: DrawTarget<Color = BinaryColor>,
+    {
+        gfx::image::Image::new(&self.down, self.down_pos).draw(target)
     }
 }
 
@@ -116,60 +194,41 @@ async fn main() -> Result<()> {
 
     let inner = Arc::new(RwLock::new(InnerState {
         ds18b20: onewire::Ds18b20::new()?,
-        client: met::Client::new()?,
-        expires: None,
-        last_response: None,
     }));
 
     let state = State { inner };
-    let text_style = gfx::mono_font::MonoTextStyle::new(&profont::PROFONT_7_POINT, BinaryColor::On);
-    let line_style = gfx::primitives::PrimitiveStyleBuilder::new()
-        .stroke_color(BinaryColor::On)
-        .stroke_width(1)
-        .build();
-    let sleep_duration = time::Duration::from_millis(1500);
 
-    let plot_x_start = 16;
-    let scale_y_minimum = 36;
-    let scale_y_maximum = 20;
-    let scale_height = (scale_y_minimum - scale_y_maximum) as f32;
+    let huge = Digits::new(INPUT_DIGITS_HUGE, Point::new(0, 0), 360, Size::new(36, 64));
+    let small = Digits::new(INPUT_DIGITS_REGULAR, Point::new(88, 0), 200, Size::new(20, 32));
+    let indicators = ArrowIndicators::new(&huge);
+    let danger = gfx::image::ImageRaw::<BinaryColor>::new(DANGER, 24);
+
+    let sleep_duration = time::Duration::from_millis(1000);
+
+    let mut last_temperature = 20.0;
 
     loop {
-        let (datapoints, home, _) = try_join!(
-            state.forecast(),
-            state.home_temperature(),
-            fallible_sleep(sleep_duration)
-        )?;
+        let (home_temperature, _) =
+            try_join!(state.home_temperature(), fallible_sleep(sleep_duration))?;
 
-        let minimum = datapoints.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-        let maximum = datapoints.iter().fold(-f32::INFINITY, |a, &b| a.max(b));
-        let range = maximum - minimum;
-        let minimum_temp = format!("{:>2.0}°", minimum);
-        let maximum_temp = format!("{:>2.0}°", maximum);
-        let home = format!("{:.1}°", home);
-
-        // Would be great to update the display in a future as well but it's a pain to store it
-        // in the `State` struct ...
         display.clear();
 
-        gfx::text::Text::new(&home, Point::new(0, 6), text_style).draw(&mut display)?;
+        let difference = home_temperature - last_temperature;
+        last_temperature = home_temperature;
 
-        // Draw scale mins and maxs
-        gfx::text::Text::new(&maximum_temp, Point::new(0, scale_y_maximum), text_style)
-            .draw(&mut display)?;
-        gfx::text::Text::new(&minimum_temp, Point::new(0, scale_y_minimum), text_style)
-            .draw(&mut display)?;
+        huge.draw(home_temperature as u8, &mut display)?;
 
-        // Draw pin plot
-        for (index, temperature) in datapoints.iter().enumerate() {
-            let x = (index * 2) as i32;
-            let height = (((temperature - minimum) / range) * scale_height) as i32;
-            let start = Point::new(plot_x_start + x, scale_y_minimum);
-            let end = Point::new(plot_x_start + x, scale_y_minimum - height);
-            gfx::primitives::Line::new(start, end)
-                .into_styled(line_style)
-                .draw(&mut display)?;
+        if difference < -0.1 {
+            indicators.draw_down(&mut display)?;
         }
+
+        if difference > 0.1 {
+            indicators.draw_up(&mut display)?;
+        }
+
+        small.draw(72, &mut display)?;
+
+        gfx::image::Image::new(&danger, Point::new(100, 40)).draw(&mut display)?;
 
         display.flush().unwrap();
     }
