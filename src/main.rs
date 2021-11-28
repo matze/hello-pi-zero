@@ -1,23 +1,4 @@
-//! # Temperature connection
-//!
-//! DS18B20 -> Pi Zero
-//!    Data -> 4
-//!
-//! # Display connection
-//!
-//! ```
-//! Display -> Pi Zero
-//!     VCC -> 3.3V
-//!     GND -> GND
-//!     CLK -> SCLK
-//!     DIN -> MOSI
-//!      CS -> 24 (BCM: CE0, 8)
-//!     D/C -> 36 (BCM: 16)
-//!     RES -> 35 (BCM: 19)
-//!
-//! ```
 mod met;
-mod onewire;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, FixedOffset};
@@ -39,7 +20,6 @@ async fn fallible_sleep(duration: time::Duration) -> Result<()> {
 }
 
 struct InnerState {
-    ds18b20: onewire::Ds18b20,
     client: met::Client,
     expires: Option<DateTime<FixedOffset>>,
     last_response: Option<met::Response>,
@@ -51,11 +31,6 @@ struct State {
 }
 
 impl State {
-    /// Read the DS18B20 temperature.
-    async fn home_temperature(&self) -> Result<f32> {
-        Ok(self.inner.read().await.ds18b20.read().await?)
-    }
-
     /// Return forecast data if not stale yet.
     async fn forecast(&self) -> Result<Vec<f32>> {
         let mut state = self.inner.write().await;
@@ -94,28 +69,17 @@ impl State {
 async fn main() -> Result<()> {
     env_logger::init();
 
-    let spi = rppal::spi::Spi::new(
-        rppal::spi::Bus::Spi0,
-        rppal::spi::SlaveSelect::Ss0,
-        400000,
-        rppal::spi::Mode::Mode0,
-    )
-    .context("Unable to create SPI object")?;
-
-    let gpio = rppal::gpio::Gpio::new()?;
-    let cs = gpio.get(8)?.into_output();
-    let dc = gpio.get(16)?.into_output();
+    let i2c = rppal::i2c::I2c::new().context("Unable to create I2c object")?;
 
     let mut display: GraphicsMode<_> = sh1106::builder::Builder::new()
         .with_size(DisplaySize::Display128x64)
-        .connect_spi(spi, dc, cs)
+        .connect_i2c(i2c)
         .into();
 
     display.init().unwrap();
     display.flush().unwrap();
 
     let inner = Arc::new(RwLock::new(InnerState {
-        ds18b20: onewire::Ds18b20::new()?,
         client: met::Client::new()?,
         expires: None,
         last_response: None,
@@ -135,24 +99,17 @@ async fn main() -> Result<()> {
     let scale_height = (scale_y_minimum - scale_y_maximum) as f32;
 
     loop {
-        let (datapoints, home, _) = try_join!(
-            state.forecast(),
-            state.home_temperature(),
-            fallible_sleep(sleep_duration)
-        )?;
+        let (datapoints, _) = try_join!(state.forecast(), fallible_sleep(sleep_duration))?;
 
         let minimum = datapoints.iter().fold(f32::INFINITY, |a, &b| a.min(b));
         let maximum = datapoints.iter().fold(-f32::INFINITY, |a, &b| a.max(b));
         let range = maximum - minimum;
         let minimum_temp = format!("{:>2.0}°", minimum);
         let maximum_temp = format!("{:>2.0}°", maximum);
-        let home = format!("{:.1}°", home);
 
         // Would be great to update the display in a future as well but it's a pain to store it
         // in the `State` struct ...
         display.clear();
-
-        gfx::text::Text::new(&home, Point::new(0, 6), text_style).draw(&mut display)?;
 
         // Draw scale mins and maxs
         gfx::text::Text::new(&maximum_temp, Point::new(0, scale_y_maximum), text_style)
